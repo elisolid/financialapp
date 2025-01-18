@@ -1,31 +1,28 @@
 /**************************************************************
- index.js (CommonJS version) 
- Uses tiktoken.encodingForModel("gpt-4") or "gpt-3.5-turbo" for chunking.
+ index.js (CommonJS, using tiktoken@1.0.7)
 
  This script:
    1) Reads a record from "Customer Financial Documents" in Airtable 
-      using your personal access token (AIRTABLE_TOKEN).
-   2) Downloads the PDF file from the "Document" field.
-   3) Parses the PDF text (pdf-parse).
-   4) Splits and embeds the text for retrieval-based question answering.
-   5) Uses GPT-4 (or gpt-3.5-turbo/gpt-4o) to answer based on top chunks.
-   6) Writes the answer into "Validation Results" with "Validation Date".
+      using AIRTABLE_TOKEN.
+   2) Downloads a PDF from the "Document" field.
+   3) Parses text with pdf-parse.
+   4) Splits text into ~500-token chunks (using getEncoding("cl100k_base")).
+   5) Creates embeddings for each chunk, retrieves the most relevant ones
+      for a user query, then uses GPT-4 to produce a final answer.
+   6) Stores the answer in "Validation Results" with "Validation Date."
 
- Environment variables in .env:
-   OPENAI_API_KEY
-   AIRTABLE_TOKEN
-   AIRTABLE_BASE_ID
+ Environment variables (in .env):
+   OPENAI_API_KEY, AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 
  Usage:
    node index.js
-   (It prompts for a question about the PDF)
 **************************************************************/
 
 require('dotenv/config');
-const fetch = require('node-fetch'); // node-fetch@2
+const fetch = require('node-fetch');      // node-fetch@2
 const pdfParse = require('pdf-parse');
 const { Configuration, OpenAIApi } = require('openai');
-const { encodingForModel } = require('tiktoken');
+const tiktoken = require('tiktoken');
 const Airtable = require('airtable');
 const readline = require('readline');
 
@@ -54,12 +51,11 @@ const rl = readline.createInterface({
 
 /**************************************************************
   2) helper: chunk text by approximate token count
-     using encodingForModel("gpt-3.5-turbo") or "gpt-4"
+     using getEncoding("cl100k_base") from tiktoken@1.0.7
 **************************************************************/
 function chunkText(text, chunkSize = 500) {
-  // pick whichever model's encoding you want
-  // "gpt-3.5-turbo" or "gpt-4" both typically use cl100k_base under the hood.
-  const encoder = encodingForModel("gpt-3.5-turbo");
+  // load the encoder for cl100k_base (used by GPT-4, GPT-3.5-turbo)
+  const encoder = tiktoken.getEncoding("cl100k_base");
 
   const paragraphs = text.split("\n\n");
   let chunks = [];
@@ -68,24 +64,20 @@ function chunkText(text, chunkSize = 500) {
 
   for (let para of paragraphs) {
     let tokens = encoder.encode(para);
-
-    // if adding these tokens to the current chunk exceeds chunkSize, finalize current chunk
+    // if adding these tokens exceeds chunkSize, finalize the current chunk
     if (tokenCount + tokens.length > chunkSize) {
       chunks.push(encoder.decode(currentTokens));
       currentTokens = tokens;
       tokenCount = tokens.length;
     } else {
-      // accumulate tokens in current chunk
       currentTokens.push(...tokens);
       tokenCount += tokens.length;
     }
   }
-
-  // push final chunk
+  // add the last chunk if non-empty
   if (currentTokens.length > 0) {
     chunks.push(encoder.decode(currentTokens));
   }
-
   return chunks;
 }
 
@@ -203,11 +195,11 @@ ${userQuery}
 Answer succinctly using only the above context. If unsure, say you don't know.
 `.trim();
 
-    // step F: call GPT-4 (or gpt-4o, or gpt-3.5-turbo)
+    // step F: call GPT-4 (or gpt-3.5-turbo if you prefer)
     let chatResp;
     try {
       chatResp = await openai.createChatCompletion({
-        model: "gpt-4", // or "gpt-4o" if you have it, or "gpt-3.5-turbo"
+        model: "gpt-4",
         messages: [
           { role: "system", content: systemMessage },
           { role: "user", content: userPrompt }
@@ -248,3 +240,4 @@ main().catch(err => {
   console.error("Script error:", err);
   process.exit(1);
 });
+
