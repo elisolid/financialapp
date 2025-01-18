@@ -1,12 +1,12 @@
 /**************************************************************
- index.js (CommonJS, using tiktoken@1.0.7)
+ index.js (CommonJS) - character-based chunking, no tiktoken
 
  This script:
    1) Reads a record from "Customer Financial Documents" in Airtable 
       using AIRTABLE_TOKEN.
    2) Downloads a PDF from the "Document" field.
    3) Parses text with pdf-parse.
-   4) Splits text into ~500-token chunks (using getEncoding("cl100k_base")).
+   4) Splits text into ~1000-char chunks (no token counting).
    5) Creates embeddings for each chunk, retrieves the most relevant ones
       for a user query, then uses GPT-4 to produce a final answer.
    6) Stores the answer in "Validation Results" with "Validation Date."
@@ -19,10 +19,9 @@
 **************************************************************/
 
 require('dotenv/config');
-const fetch = require('node-fetch');      // node-fetch@2
+const fetch = require('node-fetch'); // node-fetch@2
 const pdfParse = require('pdf-parse');
 const { Configuration, OpenAIApi } = require('openai');
-const tiktoken = require('tiktoken');
 const Airtable = require('airtable');
 const readline = require('readline');
 
@@ -50,33 +49,13 @@ const rl = readline.createInterface({
 });
 
 /**************************************************************
-  2) helper: chunk text by approximate token count
-     using getEncoding("cl100k_base") from tiktoken@1.0.7
+  2) helper: chunk text by character length (~1000 chars)
+     no token-based chunking
 **************************************************************/
-function chunkText(text, chunkSize = 500) {
-  // load the encoder for cl100k_base (used by GPT-4, GPT-3.5-turbo)
-  const encoder = tiktoken.getEncoding("cl100k_base");
-
-  const paragraphs = text.split("\n\n");
+function chunkTextByChars(text, chunkSize = 1000) {
   let chunks = [];
-  let currentTokens = [];
-  let tokenCount = 0;
-
-  for (let para of paragraphs) {
-    let tokens = encoder.encode(para);
-    // if adding these tokens exceeds chunkSize, finalize the current chunk
-    if (tokenCount + tokens.length > chunkSize) {
-      chunks.push(encoder.decode(currentTokens));
-      currentTokens = tokens;
-      tokenCount = tokens.length;
-    } else {
-      currentTokens.push(...tokens);
-      tokenCount += tokens.length;
-    }
-  }
-  // add the last chunk if non-empty
-  if (currentTokens.length > 0) {
-    chunks.push(encoder.decode(currentTokens));
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.slice(i, i + chunkSize));
   }
   return chunks;
 }
@@ -89,7 +68,7 @@ async function getEmbeddingsForChunks(chunks) {
     model: "text-embedding-ada-002",
     input: chunks
   });
-  // each item in response.data.data => { embedding: number[] }
+  // each item => { embedding: number[] }
   return response.data.data.map(item => item.embedding);
 }
 
@@ -109,7 +88,7 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 /**************************************************************
-  5) retrieve top N chunks by similarity
+  5) retrieve top N chunks
 **************************************************************/
 function retrieveTopChunks(queryEmbedding, chunks, embeddings, topN = 3) {
   const scores = embeddings.map((embed, idx) => {
@@ -121,12 +100,12 @@ function retrieveTopChunks(queryEmbedding, chunks, embeddings, topN = 3) {
 }
 
 /**************************************************************
-  main logic
+  main
 **************************************************************/
 async function main() {
   console.log("Looking for a record in 'Customer Financial Documents'...");
 
-  // step A: get a record with a PDF attachment
+  // step A: get a record with a PDF
   const records = await base("Customer Financial Documents").select({
     maxRecords: 1,
     filterByFormula: `NOT({Document} = '')`
@@ -159,10 +138,19 @@ async function main() {
   const pdfText = pdfData.text;
   console.log(`Extracted ${pdfText.length} characters from PDF text.`);
 
-  // step D: chunk & embed
-  const chunks = chunkText(pdfText, 500);
+  // step D: chunk ~1000 chars each
+  const chunks = chunkTextByChars(pdfText, 1000);
   console.log(`Created ${chunks.length} chunks.`);
-  const chunkEmbeddings = await getEmbeddingsForChunks(chunks);
+
+  // embed each chunk
+  let chunkEmbeddings;
+  try {
+    chunkEmbeddings = await getEmbeddingsForChunks(chunks);
+  } catch (err) {
+    console.error("Error getting embeddings:", err.response?.data || err);
+    process.exit(1);
+  }
+
   console.log("Obtained chunk embeddings.");
 
   // step E: ask user for question
@@ -173,11 +161,17 @@ async function main() {
     }
 
     // embed the question
-    const queryResp = await openai.createEmbedding({
-      model: "text-embedding-ada-002",
-      input: [userQuery]
-    });
-    const queryEmbedding = queryResp.data.data[0].embedding;
+    let queryEmbedding;
+    try {
+      const queryResp = await openai.createEmbedding({
+        model: "text-embedding-ada-002",
+        input: [userQuery]
+      });
+      queryEmbedding = queryResp.data.data[0].embedding;
+    } catch (err) {
+      console.error("Error embedding query:", err.response?.data || err);
+      process.exit(1);
+    }
 
     // retrieve top chunks
     const topChunks = retrieveTopChunks(queryEmbedding, chunks, chunkEmbeddings, 3);
@@ -195,11 +189,11 @@ ${userQuery}
 Answer succinctly using only the above context. If unsure, say you don't know.
 `.trim();
 
-    // step F: call GPT-4 (or gpt-3.5-turbo if you prefer)
+    // step F: call GPT-4
     let chatResp;
     try {
       chatResp = await openai.createChatCompletion({
-        model: "gpt-4",
+        model: "gpt-4", // or "gpt-3.5-turbo" if needed
         messages: [
           { role: "system", content: systemMessage },
           { role: "user", content: userPrompt }
@@ -240,4 +234,3 @@ main().catch(err => {
   console.error("Script error:", err);
   process.exit(1);
 });
-
