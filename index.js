@@ -1,57 +1,66 @@
-/**************************************************************
- index.js (CommonJS) - character-based chunking, no tiktoken
+/***************************************************************
+  index.js (ES module, Node 18+)
 
- This script:
-   1) Reads a record from "Customer Financial Documents" in Airtable 
-      using AIRTABLE_TOKEN.
-   2) Downloads a PDF from the "Document" field.
-   3) Parses text with pdf-parse.
-   4) Splits text into ~1000-char chunks (no token counting).
-   5) Creates embeddings for each chunk, retrieves the most relevant ones
-      for a user query, then uses GPT-4 to produce a final answer.
-   6) Stores the answer in "Validation Results" with "Validation Date."
+  Demonstrates:
+  - Using OpenAI project-based keys (sk-proj-...)
+  - Specifying "organization" and "project" for the new system
+  - Fetching a PDF from Airtable, parsing with pdf-parse
+  - Splitting text by characters (~1000 chars each)
+  - Generating embeddings (text-embedding-ada-002)
+  - Simple similarity retrieval
+  - Asking a GPT-4O model for an answer
+  - Storing answer in "Validation Results" with "Validation Date"
+***************************************************************/
 
- Environment variables (in .env):
-   OPENAI_API_KEY, AIRTABLE_TOKEN, AIRTABLE_BASE_ID
+import 'dotenv/config';             // loads .env
+import fetch from 'node-fetch';     // node-fetch@2
+import pdfParse from 'pdf-parse';
+import OpenAI from 'openai';        // new openai library v4.x
+import Airtable from 'airtable';
+import readline from 'readline';
 
- Usage:
-   node index.js
-**************************************************************/
+/***************************************************************
+  1) gather env vars
+***************************************************************/
+const {
+  OPENAI_API_KEY,
+  OPENAI_ORG_ID,
+  OPENAI_PROJECT_ID,
+  AIRTABLE_TOKEN,
+  AIRTABLE_BASE_ID
+} = process.env;
 
-require('dotenv/config');
-const fetch = require('node-fetch'); // node-fetch@2
-const pdfParse = require('pdf-parse');
-const { Configuration, OpenAIApi } = require('openai');
-const Airtable = require('airtable');
-const readline = require('readline');
-
-/**************************************************************
-  1) read env vars
-**************************************************************/
-const { OPENAI_API_KEY, AIRTABLE_TOKEN, AIRTABLE_BASE_ID } = process.env;
-if (!OPENAI_API_KEY || !AIRTABLE_TOKEN || !AIRTABLE_BASE_ID) {
-  console.error("Missing required env vars (OPENAI_API_KEY, AIRTABLE_TOKEN, AIRTABLE_BASE_ID).");
+// check minimal presence
+if (!OPENAI_API_KEY || !OPENAI_ORG_ID || !OPENAI_PROJECT_ID) {
+  console.error("Missing OpenAI info. Ensure OPENAI_API_KEY, OPENAI_ORG_ID, OPENAI_PROJECT_ID are in .env");
+  process.exit(1);
+}
+if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID) {
+  console.error("Missing Airtable info. Ensure AIRTABLE_TOKEN, AIRTABLE_BASE_ID are in .env");
   process.exit(1);
 }
 
-// openai config
-const openaiConfig = new Configuration({ apiKey: OPENAI_API_KEY });
-const openai = new OpenAIApi(openaiConfig);
+/***************************************************************
+  2) configure openai with new project-based approach
+     - organization: "org-BuzjqWPJ1Uq1MjbZY0w13Vmq"
+     - project:      "proj_vryVb3mt61QVmTA8IKE5GpS8"
+     - apiKey:       "sk-proj-..."
+***************************************************************/
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  organization: OPENAI_ORG_ID,
+  project: OPENAI_PROJECT_ID
+});
 
-// airtable config
+/***************************************************************
+  3) configure airtable
+***************************************************************/
 Airtable.configure({ apiKey: AIRTABLE_TOKEN });
 const base = Airtable.base(AIRTABLE_BASE_ID);
 
-// for user input
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout
-});
-
-/**************************************************************
-  2) helper: chunk text by character length (~1000 chars)
-     no token-based chunking
-**************************************************************/
+/***************************************************************
+  4) helper: chunk text by ~1000 characters
+***************************************************************/
 function chunkTextByChars(text, chunkSize = 1000) {
   let chunks = [];
   for (let i = 0; i < text.length; i += chunkSize) {
@@ -60,21 +69,9 @@ function chunkTextByChars(text, chunkSize = 1000) {
   return chunks;
 }
 
-/**************************************************************
-  3) get embeddings for an array of strings
-**************************************************************/
-async function getEmbeddingsForChunks(chunks) {
-  const response = await openai.createEmbedding({
-    model: "text-embedding-ada-002",
-    input: chunks
-  });
-  // each item => { embedding: number[] }
-  return response.data.data.map(item => item.embedding);
-}
-
-/**************************************************************
-  4) compute cosine similarity
-**************************************************************/
+/***************************************************************
+  5) compute cosine similarity
+***************************************************************/
 function cosineSimilarity(vecA, vecB) {
   let dot = 0;
   let normA = 0;
@@ -87,26 +84,29 @@ function cosineSimilarity(vecA, vecB) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-/**************************************************************
-  5) retrieve top N chunks
-**************************************************************/
+/***************************************************************
+  6) retrieve top N chunks
+***************************************************************/
 function retrieveTopChunks(queryEmbedding, chunks, embeddings, topN = 3) {
-  const scores = embeddings.map((embed, idx) => {
+  let scores = embeddings.map((embed, idx) => {
     return { index: idx, sim: cosineSimilarity(queryEmbedding, embed) };
   });
   scores.sort((a, b) => b.sim - a.sim);
-  const top = scores.slice(0, topN).map(s => chunks[s.index]);
+  let top = scores.slice(0, topN).map(s => chunks[s.index]);
   return top;
 }
 
-/**************************************************************
-  main
-**************************************************************/
+/***************************************************************
+  7) main
+***************************************************************/
 async function main() {
-  console.log("Looking for a record in 'Customer Financial Documents'...");
+  // We'll prompt user for a question
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  // step A: get a record with a PDF
-  const records = await base("Customer Financial Documents").select({
+  console.log("Searching for a PDF in 'Customer Financial Documents' table...");
+
+  // step A: find record with a PDF
+  let records = await base("Customer Financial Documents").select({
     maxRecords: 1,
     filterByFormula: `NOT({Document} = '')`
   }).all();
@@ -115,71 +115,76 @@ async function main() {
     console.log("No records found with a PDF attachment.");
     process.exit(0);
   }
-
-  const record = records[0];
-  const attachments = record.get("Document");
+  let record = records[0];
+  let attachments = record.get("Document");
   if (!attachments || attachments.length === 0) {
-    console.log("Document field is empty for that record.");
+    console.log("Document field empty.");
     process.exit(0);
   }
 
-  const pdfUrl = attachments[0].url;
+  // take the first attachment
+  let pdfUrl = attachments[0].url;
   console.log("Found PDF URL:", pdfUrl);
 
-  // step B: download pdf
-  const pdfResp = await fetch(pdfUrl);
+  // step B: fetch the PDF
+  let pdfResp = await fetch(pdfUrl);
   if (!pdfResp.ok) {
     throw new Error(`Failed to download PDF: HTTP ${pdfResp.status}`);
   }
-  const pdfBuffer = await pdfResp.buffer();
+  let pdfBuffer = await pdfResp.buffer();
 
-  // step C: parse pdf
-  const pdfData = await pdfParse(pdfBuffer);
-  const pdfText = pdfData.text;
+  // step C: parse pdf to text
+  let pdfData = await pdfParse(pdfBuffer);
+  let pdfText = pdfData.text;
   console.log(`Extracted ${pdfText.length} characters from PDF text.`);
 
-  // step D: chunk ~1000 chars each
-  const chunks = chunkTextByChars(pdfText, 1000);
+  // step D: chunk the text
+  let chunks = chunkTextByChars(pdfText, 1000);
   console.log(`Created ${chunks.length} chunks.`);
 
-  // embed each chunk
+  // step E: embed each chunk
   let chunkEmbeddings;
   try {
-    chunkEmbeddings = await getEmbeddingsForChunks(chunks);
+    let embeddingResp = await openai.embeddings.create({
+      model: "text-embedding-ada-002",
+      input: chunks
+    });
+    // each item => { embedding: number[] }
+    chunkEmbeddings = embeddingResp.data.map(d => d.embedding);
   } catch (err) {
-    console.error("Error getting embeddings:", err.response?.data || err);
+    console.error("Error embedding chunks:", err);
     process.exit(1);
   }
+  console.log("Embeddings created for chunks.");
 
-  console.log("Obtained chunk embeddings.");
-
-  // step E: ask user for question
+  // step F: ask user for question
   rl.question("Enter your question about the PDF: ", async (userQuery) => {
     if (!userQuery) {
       console.log("No question entered, exiting...");
       process.exit(0);
     }
 
-    // embed the question
+    // embed the user query
     let queryEmbedding;
     try {
-      const queryResp = await openai.createEmbedding({
+      let queryResp = await openai.embeddings.create({
         model: "text-embedding-ada-002",
         input: [userQuery]
       });
-      queryEmbedding = queryResp.data.data[0].embedding;
+      queryEmbedding = queryResp.data[0].embedding;
     } catch (err) {
-      console.error("Error embedding query:", err.response?.data || err);
+      console.error("Error embedding query:", err);
       process.exit(1);
     }
 
     // retrieve top chunks
-    const topChunks = retrieveTopChunks(queryEmbedding, chunks, chunkEmbeddings, 3);
-    console.log(`Retrieved top ${topChunks.length} chunks. Calling GPT-4 for final answer...`);
+    let topChunks = retrieveTopChunks(queryEmbedding, chunks, chunkEmbeddings, 3);
+    console.log("Top chunks retrieved. Calling GPT...");
 
-    // system + user messages
-    const systemMessage = "You are an AI reading PDF-based content.";
-    const userPrompt = `
+    // step G: call a chat model (like gpt-4o-mini or gpt-4o)
+    // Replace "gpt-4o-mini" with an actual model your project has access to
+    let systemMessage = "You are an AI reading PDF-based content.";
+    let userPrompt = `
 CONTEXT SECTIONS:
 ${topChunks.join("\n---\n")}
 
@@ -189,47 +194,46 @@ ${userQuery}
 Answer succinctly using only the above context. If unsure, say you don't know.
 `.trim();
 
-    // step F: call GPT-4
-    let chatResp;
+    let answer;
     try {
-      chatResp = await openai.createChatCompletion({
-        model: "gpt-4", // or "gpt-3.5-turbo" if needed
+      let chatResp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",  // or "gpt-4o", "gpt-4o-large", etc. depends on your project
         messages: [
           { role: "system", content: systemMessage },
           { role: "user", content: userPrompt }
         ],
         temperature: 0.0
       });
+      // response is array of choices
+      answer = chatResp.choices[0].message.content.trim();
     } catch (err) {
-      console.error("Error calling GPT model:", err.response?.data || err);
+      console.error("Error calling GPT model:", err);
       process.exit(1);
     }
 
-    const finalAnswer = chatResp.data.choices[0].message.content.trim();
-    console.log("GPT-4 answer:\n", finalAnswer);
+    console.log("GPT answer:\n", answer);
 
-    // step G: create new record in "Validation Results"
+    // step H: create new record in "Validation Results"
     try {
-      const result = await base("Validation Results").create([
+      let newRec = await base("Validation Results").create([
         {
           fields: {
             "Validation Result ID": `pdf-rag-demo-${Date.now()}`,
             "Validation Date": new Date().toISOString(),
-            "Red flags": finalAnswer
+            "Red flags": answer
           }
         }
       ]);
-      console.log("Created new record in 'Validation Results':", result[0].getId());
+      console.log("Created new record in Validation Results:", newRec[0].getId());
     } catch (err) {
       console.error("Error writing to Validation Results:", err);
     }
 
-    // done
     process.exit(0);
   });
 }
 
-// run main
+// run
 main().catch(err => {
   console.error("Script error:", err);
   process.exit(1);
