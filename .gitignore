@@ -1,1 +1,6 @@
 node_modules/
+.env
+*.log
+.DS_Store
+financial-app-448316-a302a4f5707a.json
+setup.sh
